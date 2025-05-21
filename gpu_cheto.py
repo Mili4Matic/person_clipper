@@ -2,19 +2,22 @@
 """
 person_clip_extractor.py – GPU ready, persistent IDs
 
-Scan one video or a directory and save **one** JSON with every clip where exactly
-one person is visible. Each logical person keeps the same `person_id` across
-clips and videos thanks to a simple face‑embedding comparison.
+Extract segments (start_ms / end_ms) where exactly **one** person appears across
+multiple videos.  All clips are written into a single JSON file.
 
-Output example (clips.json):
-[
-  {"video_id": "video1", "person_id": 1, "start_ms": 12000, "end_ms": 22000},
-  {"video_id": "video1", "person_id": 2, "start_ms": 30000, "end_ms": 38000},
-  {"video_id": "video2", "person_id": 1, "start_ms":  5000, "end_ms": 15000}
-]
+Person identities persist across files by comparing face embeddings.
 
-Dependencies (Python ≥ 3.9):
-    pip install ultralytics opencv-python face_recognition
+Dependencies (Python ≥ 3.9)
+──────────────────────────
+Option A – pre‑built wheels (recommended, no compilation):
+    pip install dlib-bin face_recognition opencv-python ultralytics
+
+Option B – build dlib from source (Linux):
+    sudo apt install build-essential cmake libopenblas-dev liblapack-dev libx11-dev libgtk-3-dev
+    pip install dlib face_recognition opencv-python ultralytics
+
+If **face_recognition** is missing at runtime, the script still works but will
+assign incremental IDs per appearance (no cross‑video matching).
 
 Default paths:
   input dir : /media/mili/EXTERNAL_USB/Editor_videos/procesar
@@ -22,14 +25,20 @@ Default paths:
 """
 from __future__ import annotations
 
-import argparse, json
+import argparse, json, sys
 from pathlib import Path
 from typing import List, Dict, Iterable, Union
 
 import cv2
-import face_recognition
 import numpy as np
 from ultralytics import YOLO
+
+try:
+    import face_recognition  # type: ignore
+    FACE_OK = True
+except ImportError as e:
+    FACE_OK = False
+    print("[warn] face_recognition not available – persistent IDs disabled", file=sys.stderr)
 
 # ───────── helpers ──────────
 
@@ -38,6 +47,8 @@ def _ms(frame: int, fps: float) -> int:
 
 
 def _face_encoding(img: np.ndarray, box: list[float]):
+    if not FACE_OK:
+        return None
     x1, y1, x2, y2 = [int(v) for v in box]
     crop = img[y1:y2, x1:x2]
     if crop.size == 0:
@@ -49,9 +60,9 @@ def _face_encoding(img: np.ndarray, box: list[float]):
 
 def _match(enc, known: List[Dict], next_id: list[int], tol: float = 0.55) -> int:
     """Return persistent id for this encoding, adding a new one if needed."""
-    if enc is None or not known:
+    if enc is None or not known or not FACE_OK:
         pid = next_id[0]
-        if enc is not None:
+        if enc is not None and FACE_OK:
             known.append({"id": pid, "enc": enc})
         next_id[0] += 1
         return pid
@@ -88,7 +99,6 @@ def _segments(video: Path, model: YOLO, *, conf: float, device: Union[str, int],
 
         if len(ids) == 1:
             tid = ids[0]
-            # bbox for that tracked id
             boxes = r.boxes.xyxy.cpu().tolist()
             tids = ids_t.cpu().tolist()
             bbox = next(b for b, t in zip(boxes, tids) if t == tid)
@@ -156,7 +166,7 @@ def process_many(dir_in: Path, *, weights, conf, device, patterns) -> List[Dict]
 # ────────── CLI ───────────
 
 def _cli():
-    p = argparse.ArgumentParser(description="Save timestamps (single JSON) where exactly one person is visible – persistent IDs")
+    p = argparse.ArgumentParser(description="Detect clips with exactly one person; output single JSON; persistent IDs if face_recognition is available")
     p.add_argument("--input")
     p.add_argument("--input-dir", default="/media/mili/EXTERNAL_USB/Editor_videos/procesar")
     p.add_argument("--out-file")
@@ -189,4 +199,3 @@ def _cli():
 
 if __name__ == "__main__":
     _cli()
-
