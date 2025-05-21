@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-person_clip_extractor.py – GPU‑ready
+person_clip_extractor.py – GPU ready, single JSON output
 
-Scans videos and stores JSON clips where **exactly one** person appears.
+Scan one video or a whole directory and extract segments where **exactly one** person
+is visible. All clips from all processed videos are written into **one** JSON file.
 
-JSON schema (one file per video):
+Output example (clips.json):
 [
-  {"video_id": "<filename_without_ext>", "person_id": <int>, "start_ms": <int>, "end_ms": <int>},
-  ...
+  {"video_id": "video1", "person_id": 3, "start_ms": 10000, "end_ms": 20000},
+  {"video_id": "video1", "person_id": 7, "start_ms": 21000, "end_ms": 30000},
+  {"video_id": "video2", "person_id": 5, "start_ms": 5000,  "end_ms": 15000}
 ]
 
-Each element corresponds to a single continuous appearance of one person.
+CLI example (defaults use GPU 0):
+    python person_clip_extractor.py           # dir → clips.json
+    python person_clip_extractor.py --input video.mp4 --out-file clip.json
+    python person_clip_extractor.py --device cpu
 
-CLI extras:
-  --device 0   # GPU (default)
-  --device cpu # force CPU
-
-Default dirs:
-  input  : /media/mili/EXTERNAL_USB/Editor_videos/procesar
-  output : /media/mili/EXTERNAL_USB/Editor_videos/output
+Default paths:
+  input dir : /media/mili/EXTERNAL_USB/Editor_videos/procesar
+  output dir: /media/mili/EXTERNAL_USB/Editor_videos/output
 """
 from __future__ import annotations
 
@@ -51,7 +52,7 @@ def _segments(video: Path, model: YOLO, *, conf: float, device: Union[str, int])
         ids = r.boxes.id.cpu().tolist() if r.boxes.id is not None else []
         ids = list(set(ids))
 
-        if len(ids) == 1:
+        if len(ids) == 1:  # exactly one person in frame
             cur = int(ids[0])
             if st is None:
                 st, pid = idx, cur
@@ -86,60 +87,62 @@ def _load_model(weights: str | Path, device: Union[str, int]):
     return m
 
 
-def process_video(video: Path, out_dir: Path, *, model: YOLO | None, conf: float, device):
-    if model is None:
-        raise ValueError("model must be provided")
-
+def process_video(video: Path, *, model: YOLO, conf: float, device) -> List[Dict]:
     segs = _segments(video, model, conf=conf, device=device)
-    if not segs:
-        print(f"[skip] {video.name}")
-        return
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    clips = [ {"video_id": video.stem, **seg} for seg in segs ]
-    (out_dir / f"{video.stem}.json").write_text(json.dumps(clips, indent=2))
-    print(f"[json] {video.name}: {len(clips)} clip(s)")
+    for s in segs:
+        s["video_id"] = video.stem
+    print(f"[done] {video.name}: {len(segs)} clip(s)")
+    return segs
 
 
-def process_dir(
+def process_many(
     in_dir: Path,
-    out_dir: Path,
     *,
     weights: str | Path,
     conf: float,
     device: Union[str, int],
-    patterns: Iterable[str] = ("*.mp4", "*.mov", "*.mkv", "*.avi", "*.m4v"),
-):
+    patterns: Iterable[str],
+) -> List[Dict]:
     vids = _videos(in_dir, patterns)
     if not vids:
         print(f"No videos in {in_dir}")
-        return
+        return []
 
     model = _load_model(weights, device)
+    all_clips: List[Dict] = []
     for v in vids:
-        process_video(v, out_dir, model=model, conf=conf, device=device)
+        all_clips.extend(process_video(v, model=model, conf=conf, device=device))
+    return all_clips
 
 # ────────── CLI ───────────
 
 def _cli():
-    p = argparse.ArgumentParser(description="Save timestamps where exactly one person is visible (GPU ready)")
-    p.add_argument("--input")
-    p.add_argument("--output-dir")
+    p = argparse.ArgumentParser(description="Save timestamps (single JSON) where exactly one person is visible")
+    p.add_argument("--input", help="single video file")
     p.add_argument("--input-dir", default="/media/mili/EXTERNAL_USB/Editor_videos/procesar")
-    p.add_argument("--default-out-dir", default="/media/mili/EXTERNAL_USB/Editor_videos/output")
+    p.add_argument("--out-file", help="JSON path to write")
+    p.add_argument("--output-dir", default="/media/mili/EXTERNAL_USB/Editor_videos/output")
     p.add_argument("--model", default="yolov8n.pt")
     p.add_argument("--conf", type=float, default=0.3)
     p.add_argument("--device", default="0", help="GPU id or 'cpu'")
+    p.add_argument("--patterns", nargs="*", default=["*.mp4", "*.mov", "*.mkv", "*.avi", "*.m4v"],
+                   help="glob patterns for videos")
     args = p.parse_args()
 
+    out_file = Path(args.out_file) if args.out_file else Path(args.output_dir) / "clips.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
     if args.input:
-        if not args.output_dir:
-            p.error("--output-dir is required with --input")
-        m = _load_model(args.model, args.device)
-        process_video(Path(args.input), Path(args.output_dir), model=m, conf=args.conf, device=args.device)
+        model = _load_model(args.model, args.device)
+        clips = process_video(Path(args.input), model=model, conf=args.conf, device=args.device)
     else:
-        out_dir = Path(args.output_dir or args.default_out_dir)
-        process_dir(Path(args.input_dir), out_dir, weights=args.model, conf=args.conf, device=args.device)
+        clips = process_many(Path(args.input_dir), weights=args.model, conf=args.conf, device=args.device, patterns=args.patterns)
+
+    if clips:
+        out_file.write_text(json.dumps(clips, indent=2))
+        print(f"[json] wrote {len(clips)} clip(s) to {out_file}")
+    else:
+        print("No clips detected; nothing written")
 
 
 if __name__ == "__main__":
