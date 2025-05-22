@@ -7,7 +7,7 @@ multiple videos.  All clips are written into a single JSON file.
 
 Person identities persist across files by comparing face embeddings.
 
-Dependencies (Python ≥ 3.9)
+Dependencies (Python ≥ 3.9)
 ──────────────────────────
 Option A – pre‑built wheels (recommended, no compilation):
     pip install dlib-bin face_recognition opencv-python ultralytics
@@ -20,8 +20,8 @@ If **face_recognition** is missing at runtime, the script still works but will
 assign incremental IDs per appearance (no cross‑video matching).
 
 Default paths:
-  input dir : /media/mili/EXTERNAL_USB/Editor_videos/procesar
-  output dir: /media/mili/EXTERNAL_USB/Editor_videos/output
+  input dir : /media/linuxbida/EXTERNAL_USB/Editor_videos/procesar
+  output dir: /media/linuxbida/EXTERNAL_USB/Editor_videos/output
 """
 from __future__ import annotations
 
@@ -76,6 +76,63 @@ def _match(enc, known: List[Dict], next_id: list[int], tol: float = 0.55) -> int
     known.append({"id": pid, "enc": enc})
     next_id[0] += 1
     return pid
+
+
+def _filter_and_merge_clips(clips: List[Dict], min_duration_ms: int = 100, merge_gap_ms: int = 500) -> List[Dict]:
+    """
+    Filter out clips shorter than min_duration_ms and merge consecutive clips 
+    from the same person that are separated by less than merge_gap_ms.
+    """
+    if not clips:
+        return []
+    
+    # First, filter out clips that are too short
+    filtered_clips = []
+    for clip in clips:
+        duration = clip["end_ms"] - clip["start_ms"]
+        if duration >= min_duration_ms:
+            filtered_clips.append(clip)
+    
+    if not filtered_clips:
+        return []
+    
+    # Sort clips by video_id and start_ms to ensure proper ordering
+    filtered_clips.sort(key=lambda x: (x["video_id"], x["start_ms"]))
+    
+    # Group clips by video_id first
+    video_groups = {}
+    for clip in filtered_clips:
+        video_id = clip["video_id"]
+        if video_id not in video_groups:
+            video_groups[video_id] = []
+        video_groups[video_id].append(clip)
+    
+    # Merge clips within each video
+    merged_clips = []
+    for video_id, video_clips in video_groups.items():
+        if not video_clips:
+            continue
+            
+        # Sort clips by start time
+        video_clips.sort(key=lambda x: x["start_ms"])
+        
+        current_clip = video_clips[0].copy()
+        
+        for next_clip in video_clips[1:]:
+            # Check if clips are from same person and close enough to merge
+            if (current_clip["person_id"] == next_clip["person_id"] and 
+                next_clip["start_ms"] - current_clip["end_ms"] <= merge_gap_ms):
+                # Merge clips by extending the end time
+                current_clip["end_ms"] = next_clip["end_ms"]
+            else:
+                # Save current clip and start a new one
+                merged_clips.append(current_clip)
+                current_clip = next_clip.copy()
+        
+        # Don't forget the last clip
+        merged_clips.append(current_clip)
+    
+    return merged_clips
 
 
 # ───────── core detection ──────────
@@ -161,6 +218,10 @@ def process_many(dir_in: Path, *, weights, conf, device, patterns) -> List[Dict]
     for v in vids:
         clips.extend(process_video(v, model=model, conf=conf, device=device,
                                    known=known, next_id=next_id))
+    
+    # Apply filtering and merging
+    clips = _filter_and_merge_clips(clips)
+    
     return clips
 
 # ────────── CLI ───────────
@@ -168,13 +229,15 @@ def process_many(dir_in: Path, *, weights, conf, device, patterns) -> List[Dict]
 def _cli():
     p = argparse.ArgumentParser(description="Detect clips with exactly one person; output single JSON; persistent IDs if face_recognition is available")
     p.add_argument("--input")
-    p.add_argument("--input-dir", default="/media/mili/EXTERNAL_USB/Editor_videos/procesar")
+    p.add_argument("--input-dir", default="/media/linuxbida/EXTERNAL_USB/Editor_videos/testing/procesar")
     p.add_argument("--out-file")
-    p.add_argument("--output-dir", default="/media/mili/EXTERNAL_USB/Editor_videos/output")
+    p.add_argument("--output-dir", default="/media/linuxbida/EXTERNAL_USB/Editor_videos/testing/output")
     p.add_argument("--model", default="yolov8n.pt")
     p.add_argument("--conf", type=float, default=0.3)
     p.add_argument("--device", default="0")
     p.add_argument("--patterns", nargs="*", default=["*.mp4", "*.mov", "*.mkv", "*.avi", "*.m4v"])
+    p.add_argument("--min-duration", type=int, default=100, help="Minimum clip duration in ms (default: 100)")
+    p.add_argument("--merge-gap", type=int, default=500, help="Maximum gap in ms to merge consecutive clips from same person (default: 500)")
     args = p.parse_args()
 
     of = Path(args.out_file) if args.out_file else Path(args.output_dir) / "clips.json"
@@ -186,6 +249,8 @@ def _cli():
         next_id = [1]
         clips = process_video(Path(args.input), model=model, conf=args.conf,
                                device=args.device, known=known, next_id=next_id)
+        # Apply filtering and merging for single video processing too
+        clips = _filter_and_merge_clips(clips, args.min_duration, args.merge_gap)
     else:
         clips = process_many(Path(args.input_dir), weights=args.model, conf=args.conf,
                              device=args.device, patterns=args.patterns)
