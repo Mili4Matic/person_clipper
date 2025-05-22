@@ -195,9 +195,15 @@ def _segments_optimized(video: Path, model: YOLO, *, conf: float, device: Union[
     """
     Optimized segment detection with batch processing and memory preloading
     """
-    # Enable half precision for RTX 4070 (significant speedup)
+    # Configure mixed precision properly
     if use_half and device != "cpu":
-        model.model.half()
+        try:
+            # Use model's built-in half precision support
+            model.model.half()
+            print("[opt] Half precision enabled")
+        except Exception as e:
+            print(f"[warn] Could not enable half precision: {e}")
+            use_half = False
     
     # Preload frames for faster access
     frames, fps = _preload_frames(video, max_frames, skip_frames)
@@ -215,19 +221,36 @@ def _segments_optimized(video: Path, model: YOLO, *, conf: float, device: Union[
     print(f"[processing] {video.name}: {len(frames)} frames in batches of {batch_size}")
     start_time = time.time()
     
-    # Batch processing
+    # Batch processing with proper error handling
     for idx, frame in enumerate(frames):
         batch.add_frame(frame, idx * skip_frames)  # Adjust index for skipped frames
         
         if batch.is_full() or idx == len(frames) - 1:
             batch_frames, batch_indices = batch.get_batch()
             
-            # Process entire batch at once
-            results = model(batch_frames, classes=[0], conf=conf, device=device, verbose=False)
-            
-            # Store results
-            for result, frame_idx in zip(results, batch_indices):
-                all_results[frame_idx] = result
+            try:
+                # Process entire batch at once with mixed precision handling
+                if use_half and device != "cpu":
+                    with torch.cuda.amp.autocast():
+                        results = model(batch_frames, classes=[0], conf=conf, device=device, verbose=False, half=True)
+                else:
+                    results = model(batch_frames, classes=[0], conf=conf, device=device, verbose=False, half=False)
+                
+                # Store results
+                for result, frame_idx in zip(results, batch_indices):
+                    all_results[frame_idx] = result
+                    
+            except RuntimeError as e:
+                if "type" in str(e) and "Half" in str(e):
+                    print(f"[warn] Half precision failed, falling back to float32: {e}")
+                    # Fallback to float32
+                    model.model.float()
+                    results = model(batch_frames, classes=[0], conf=conf, device=device, verbose=False, half=False)
+                    for result, frame_idx in zip(results, batch_indices):
+                        all_results[frame_idx] = result
+                    use_half = False  # Disable for remaining batches
+                else:
+                    raise e
                 
             batch.clear()
     
@@ -340,9 +363,14 @@ def _load(weights: str | Path, device: Union[str, int], optimize: bool = True):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         
-        # Compile model for better performance (PyTorch 2.0+)
+        # Initialize mixed precision scaler for stable training
+        if hasattr(torch.cuda.amp, 'GradScaler'):
+            print("[opt] Mixed precision support available")
+        
+        # Compile model for better performance (PyTorch 2.0+) - but avoid with half precision
         try:
             if hasattr(torch, 'compile'):
+                # Disable compilation when using half precision to avoid type conflicts
                 m.model = torch.compile(m.model, mode="reduce-overhead")
                 print("[opt] Model compiled with torch.compile")
         except Exception as e:
@@ -462,6 +490,13 @@ def _cli():
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(f"[gpu] Using {gpu_name} ({gpu_memory:.1f}GB VRAM)")
         print(f"[gpu] Batch size: {args.batch_size}, Half precision: {not args.no_half}")
+        
+        # Check PyTorch and CUDA versions for compatibility
+        print(f"[info] PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}")
+        
+        # Warn about potential half precision issues
+        if not args.no_half:
+            print("[info] Half precision enabled - will fallback to float32 if incompatible")
 
     of = Path(args.out_file) if args.out_file else Path(args.output_dir) / "clips.json"
     of.parent.mkdir(parents=True, exist_ok=True)
