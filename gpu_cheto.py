@@ -1,78 +1,168 @@
 #!/usr/bin/env python3
 """
-person_clip_extractor.py – GPU optimized for RTX 4070, persistent IDs
+person_clip_extractor.py – RTX 4070 BEAST MODE 🔥
 
-Extract segments (start_ms / end_ms) where exactly **one** person appears across
-multiple videos. Optimized for batch processing on modern GPUs.
+Extract segments where exactly one person appears - MAXIMUM GPU UTILIZATION
+Designed to push RTX 4070 laptop to its limits.
 
-Dependencies (Python ≥ 3.9)
-──────────────────────────
-Option A – pre‑built wheels (recommended, no compilation):
-    pip install dlib-bin face_recognition opencv-python ultralytics torch torchvision
-
-Option B – build dlib from source (Linux):
-    sudo apt install build-essential cmake libopenblas-dev liblapack-dev libx11-dev libgtk-3-dev
-    pip install dlib face_recognition opencv-python ultralytics torch torchvision
-
-If **face_recognition** is missing at runtime, the script still works but will
-assign incremental IDs per appearance (no cross‑video matching).
-
-Default paths:
-  input dir : /media/linuxbida/EXTERNAL_USB/Editor_videos/procesar
-  output dir: /media/linuxbida/EXTERNAL_USB/Editor_videos/output
+Dependencies:
+    pip install ultralytics torch torchvision opencv-python face_recognition dlib-bin
+    pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu118
 """
 from __future__ import annotations
 
-import argparse, json, sys, time
+import argparse, json, sys, time, gc, psutil, os
 from pathlib import Path
 from typing import List, Dict, Iterable, Union
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from queue import Queue
+import multiprocessing as mp
 
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 from ultralytics import YOLO
 
 try:
-    import face_recognition  # type: ignore
+    import face_recognition
     FACE_OK = True
-except ImportError as e:
+except ImportError:
     FACE_OK = False
     print("[warn] face_recognition not available – persistent IDs disabled", file=sys.stderr)
 
-# ───────── helpers ──────────
+# ═══════════ GPU BEAST MODE CONFIGURATION ═══════════
+
+class GPUOptimizer:
+    def __init__(self, device: str = "0"):
+        self.device = device
+        self.setup_beast_mode()
+    
+    def setup_beast_mode(self):
+        """Configure PyTorch for MAXIMUM performance"""
+        if not torch.cuda.is_available():
+            return
+            
+        # Maximum CUDA optimization
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        
+        # Memory management
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, 'memory_pool'):
+            torch.cuda.memory_pool.empty_cache()
+        
+        # Set memory fraction to use almost all VRAM
+        torch.cuda.set_per_process_memory_fraction(0.95)
+        
+        print(f"[🔥] BEAST MODE ACTIVATED for RTX 4070!")
+        self.print_gpu_info()
+    
+    def print_gpu_info(self):
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            total_memory = props.total_memory / 1024**3
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            cached = torch.cuda.memory_reserved() / 1024**3
+            print(f"[GPU] {props.name}")
+            print(f"[MEM] Total: {total_memory:.1f}GB | Allocated: {allocated:.1f}GB | Cached: {cached:.1f}GB")
+            print(f"[CUDA] Cores: {props.multi_processor_count} | Capability: {props.major}.{props.minor}")
+
+
+# ═══════════ ULTRA-FAST DATASET ═══════════
+
+class VideoFrameDataset(Dataset):
+    """Custom dataset for ultra-fast batch loading"""
+    
+    def __init__(self, video_path: Path, skip_frames: int = 1, max_frames: int = None):
+        self.video_path = video_path
+        self.skip_frames = skip_frames
+        self.max_frames = max_frames
+        
+        # Pre-calculate frame indices
+        cap = cv2.VideoCapture(str(video_path))
+        self.fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        
+        self.frame_indices = list(range(0, total_frames, skip_frames))
+        if max_frames:
+            self.frame_indices = self.frame_indices[:max_frames]
+        
+        print(f"[dataset] {video_path.name}: {len(self.frame_indices)} frames to process")
+    
+    def __len__(self):
+        return len(self.frame_indices)
+    
+    def __getitem__(self, idx):
+        frame_idx = self.frame_indices[idx]
+        
+        # Fast frame extraction
+        cap = cv2.VideoCapture(str(self.video_path))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        cap.release()
+        
+        if not ret:
+            # Return black frame if failed
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        
+        return frame, frame_idx
+
+
+class MultiThreadVideoLoader:
+    """Asynchronous video frame loader with thread pool"""
+    
+    def __init__(self, video_path: Path, batch_size: int, skip_frames: int = 1, 
+                 max_frames: int = None, num_workers: int = 4):
+        self.dataset = VideoFrameDataset(video_path, skip_frames, max_frames)
+        self.dataloader = DataLoader(
+            self.dataset, 
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4
+        )
+        
+    def __iter__(self):
+        return iter(self.dataloader)
+
+
+# ═══════════ TURBO PROCESSING ENGINE ═══════════
 
 def _ms(frame: int, fps: float) -> int:
     return int(frame / fps * 1000)
 
 
-def _face_encoding(img: np.ndarray, box: list[float]):
-    if not FACE_OK:
-        return None
-    x1, y1, x2, y2 = [int(v) for v in box]
-    crop = img[y1:y2, x1:x2]
-    if crop.size == 0:
-        return None
-    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-    enc = face_recognition.face_encodings(rgb)
-    return enc[0] if enc else None
-
-
-def _match(enc, known: List[Dict], next_id: list[int], tol: float = 0.55) -> int:
-    """Return persistent id for this encoding, adding a new one if needed."""
+def _match_fast(enc, known: List[Dict], next_id: list[int], tol: float = 0.6) -> int:
+    """Super fast face matching with optimizations"""
     if enc is None or not known or not FACE_OK:
         pid = next_id[0]
-        if enc is not None and FACE_OK:
-            known.append({"id": pid, "enc": enc})
         next_id[0] += 1
         return pid
 
-    encs = [k["enc"] for k in known]
-    match = face_recognition.compare_faces(encs, enc, tolerance=tol)
-    if True in match:
-        return known[match.index(True)]["id"]
+    # Use numpy for faster comparison
+    if len(known) > 10:  # Only for larger face databases
+        encs = np.array([k["enc"] for k in known])
+        distances = np.linalg.norm(encs - enc, axis=1)
+        min_idx = np.argmin(distances)
+        if distances[min_idx] <= tol:
+            return known[min_idx]["id"]
+    else:
+        # Use face_recognition for smaller databases
+        encs = [k["enc"] for k in known]
+        matches = face_recognition.compare_faces(encs, enc, tolerance=tol)
+        if True in matches:
+            return known[matches.index(True)]["id"]
 
+    # Add new person
     pid = next_id[0]
     known.append({"id": pid, "enc": enc})
     next_id[0] += 1
@@ -80,303 +170,300 @@ def _match(enc, known: List[Dict], next_id: list[int], tol: float = 0.55) -> int
 
 
 def _filter_and_merge_clips(clips: List[Dict], min_duration_ms: int = 100, merge_gap_ms: int = 500) -> List[Dict]:
-    """
-    Filter out clips shorter than min_duration_ms and merge consecutive clips 
-    from the same person that are separated by less than merge_gap_ms.
-    """
+    """Optimized clip filtering and merging"""
     if not clips:
         return []
     
-    # First, filter out clips that are too short
-    filtered_clips = []
-    for clip in clips:
-        duration = clip["end_ms"] - clip["start_ms"]
-        if duration >= min_duration_ms:
-            filtered_clips.append(clip)
+    # Vectorized filtering
+    filtered_clips = [c for c in clips if (c["end_ms"] - c["start_ms"]) >= min_duration_ms]
     
     if not filtered_clips:
         return []
     
-    # Sort clips by video_id and start_ms to ensure proper ordering
-    filtered_clips.sort(key=lambda x: (x["video_id"], x["start_ms"]))
+    # Fast sorting
+    filtered_clips.sort(key=lambda x: (x["video_id"], x["person_id"], x["start_ms"]))
     
-    # Group clips by video_id first
-    video_groups = {}
-    for clip in filtered_clips:
-        video_id = clip["video_id"]
-        if video_id not in video_groups:
-            video_groups[video_id] = []
-        video_groups[video_id].append(clip)
-    
-    # Merge clips within each video
+    # Optimized merging
     merged_clips = []
-    for video_id, video_clips in video_groups.items():
-        if not video_clips:
-            continue
+    current_clip = None
+    
+    for clip in filtered_clips:
+        if (current_clip is None or 
+            current_clip["video_id"] != clip["video_id"] or
+            current_clip["person_id"] != clip["person_id"] or
+            clip["start_ms"] - current_clip["end_ms"] > merge_gap_ms):
             
-        # Sort clips by start time
-        video_clips.sort(key=lambda x: x["start_ms"])
-        
-        current_clip = video_clips[0].copy()
-        
-        for next_clip in video_clips[1:]:
-            # Check if clips are from same person and close enough to merge
-            if (current_clip["person_id"] == next_clip["person_id"] and 
-                next_clip["start_ms"] - current_clip["end_ms"] <= merge_gap_ms):
-                # Merge clips by extending the end time
-                current_clip["end_ms"] = next_clip["end_ms"]
-            else:
-                # Save current clip and start a new one
+            if current_clip is not None:
                 merged_clips.append(current_clip)
-                current_clip = next_clip.copy()
-        
-        # Don't forget the last clip
+            current_clip = clip.copy()
+        else:
+            # Merge clips
+            current_clip["end_ms"] = clip["end_ms"]
+    
+    if current_clip is not None:
         merged_clips.append(current_clip)
     
     return merged_clips
 
 
-class FrameBatch:
-    """Handles batched frame processing for GPU optimization"""
+# ═══════════ BEAST MODE PROCESSING ═══════════
+
+class RTX4070BeastProcessor:
+    """RTX 4070 optimized processing engine"""
     
-    def __init__(self, batch_size: int = 32):
-        self.batch_size = batch_size
-        self.frames = []
-        self.frame_indices = []
+    def __init__(self, weights: str, device: str = "0", conf: float = 0.25):
+        self.gpu_opt = GPUOptimizer(device)
+        self.device = device
+        self.conf = conf
         
-    def add_frame(self, frame: np.ndarray, idx: int):
-        self.frames.append(frame)
-        self.frame_indices.append(idx)
+        # Load and optimize model
+        self.model = self._load_beast_model(weights)
         
-    def is_full(self) -> bool:
-        return len(self.frames) >= self.batch_size
+        # Processing stats
+        self.total_frames = 0
+        self.total_time = 0
         
-    def clear(self):
-        self.frames.clear()
-        self.frame_indices.clear()
+    def _load_beast_model(self, weights: str):
+        """Load YOLO model with MAXIMUM optimizations"""
+        print(f"[🚀] Loading model in BEAST MODE...")
         
-    def get_batch(self):
-        return self.frames.copy(), self.frame_indices.copy()
-
-
-def _get_video_info(video_path: Path) -> tuple[float, int]:
-    """Get basic video information without loading frames"""
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
-    return fps, frame_count
-
-
-def _frame_generator(video_path: Path, skip_frames: int = 1, max_frames: int = None):
-    """
-    Generator that yields frames without loading entire video into memory
-    """
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        print(f"[error] Could not open video: {video_path}")
-        return
-    
-    frame_idx = 0
-    actual_idx = 0
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-            
-        if frame_idx % skip_frames == 0:
-            yield frame, frame_idx
-            actual_idx += 1
-            if max_frames and actual_idx >= max_frames:
-                break
-            
-        frame_idx += 1
-    
-    cap.release()
-
-
-def _segments_optimized(video: Path, model: YOLO, *, conf: float, device: Union[str, int],
-                       known: List[Dict], next_id: list[int], batch_size: int = 32,
-                       max_frames: int = None, skip_frames: int = 1, use_half: bool = True) -> List[Dict]:
-    """
-    Memory-efficient segment detection with batch processing
-    """
-    # Configure mixed precision properly
-    if use_half and device != "cpu":
-        try:
-            # Use model's built-in half precision support
-            model.model.half()
-            print("[opt] Half precision enabled")
-        except Exception as e:
-            print(f"[warn] Could not enable half precision: {e}")
-            use_half = False
-    
-    # Get video info without loading frames
-    fps, total_frames = _get_video_info(video)
-    estimated_frames = min(total_frames // skip_frames, max_frames or float('inf'))
-    print(f"[processing] {video.name}: ~{estimated_frames} frames to process (fps={fps:.1f})")
-    
-    segs: List[Dict] = []
-    st = end = None
-    pid = None
-    
-    # Process frames in batches using generator (memory efficient)
-    batch = FrameBatch(batch_size)
-    all_results = {}
-    
-    start_time = time.time()
-    processed_frames = 0
-    
-    # Use frame generator instead of preloading
-    for frame, frame_idx in _frame_generator(video, skip_frames, max_frames):
-        batch.add_frame(frame, frame_idx)
-        processed_frames += 1
+        model = YOLO(weights)
+        model.to(self.device)
         
-        if batch.is_full():
-            batch_frames, batch_indices = batch.get_batch()
-            
+        # Enable all optimizations
+        if self.device != "cpu":
+            # Use half precision if possible
             try:
-                # Process batch with proper memory management
-                if use_half and device != "cpu":
-                    with torch.cuda.amp.autocast():
-                        results = model(batch_frames, classes=[0], conf=conf, device=device, verbose=False, half=True)
+                model.model.half()
+                print("[⚡] Half precision enabled")
+            except:
+                print("[⚠️] Half precision failed, using float32")
+            
+            # Compile model for maximum speed
+            try:
+                if hasattr(torch, 'compile'):
+                    model.model = torch.compile(
+                        model.model, 
+                        mode="max-autotune",  # Maximum optimization
+                        fullgraph=True,
+                        dynamic=False
+                    )
+                    print("[🔥] Model compiled with max-autotune")
+            except Exception as e:
+                print(f"[warn] Compilation failed: {e}")
+        
+        return model
+    
+    def process_video_beast_mode(self, video_path: Path, batch_size: int = 64, 
+                                skip_frames: int = 1, max_frames: int = None,
+                                known: List[Dict] = None, next_id: list[int] = None) -> List[Dict]:
+        """Process video with MAXIMUM RTX 4070 utilization"""
+        
+        if known is None:
+            known = []
+        if next_id is None:
+            next_id = [1]
+        
+        print(f"\n[🔥] BEAST MODE PROCESSING: {video_path.name}")
+        print(f"[⚙️] Batch size: {batch_size} | Skip frames: {skip_frames}")
+        
+        # Create turbo loader
+        loader = MultiThreadVideoLoader(
+            video_path, batch_size, skip_frames, max_frames, num_workers=6
+        )
+        
+        segs: List[Dict] = []
+        st = end = None
+        pid = None
+        
+        start_time = time.time()
+        processed_batches = 0
+        
+        # MAXIMUM SPEED PROCESSING
+        with torch.cuda.amp.autocast(enabled=True):  # Mixed precision
+            for batch_frames, batch_indices in loader:
+                processed_batches += 1
+                batch_start = time.time()
+                
+                # Convert to tensor for GPU processing
+                if isinstance(batch_frames, (list, tuple)):
+                    frames_tensor = torch.stack([torch.from_numpy(f) for f in batch_frames])
                 else:
-                    results = model(batch_frames, classes=[0], conf=conf, device=device, verbose=False, half=False)
+                    frames_tensor = batch_frames
                 
-                # Store results and clear GPU memory
-                for result, frame_idx in zip(results, batch_indices):
-                    all_results[frame_idx] = result
+                # Ultra-fast inference
+                try:
+                    results = self.model(
+                        batch_frames.numpy() if hasattr(batch_frames, 'numpy') else batch_frames,
+                        classes=[0],  # Only person class
+                        conf=self.conf,
+                        device=self.device,
+                        verbose=False,
+                        half=True,
+                        agnostic_nms=True,  # Faster NMS
+                        max_det=10  # Limit detections for speed
+                    )
+                except Exception as e:
+                    print(f"[error] Batch processing failed: {e}")
+                    continue
                 
-                # Clear GPU cache periodically
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Process results FAST
+                for result, frame_idx in zip(results, batch_indices.numpy() if hasattr(batch_indices, 'numpy') else batch_indices):
+                    person_count = 0
+                    bbox = None
                     
-            except RuntimeError as e:
-                if "type" in str(e) and "Half" in str(e):
-                    print(f"[warn] Half precision failed, falling back to float32")
-                    model.model.float()
-                    results = model(batch_frames, classes=[0], conf=conf, device=device, verbose=False, half=False)
-                    for result, frame_idx in zip(results, batch_indices):
-                        all_results[frame_idx] = result
-                    use_half = False
-                elif "out of memory" in str(e).lower():
-                    print(f"[error] GPU out of memory. Try reducing batch size from {batch_size}")
-                    raise e
-                else:
-                    raise e
+                    if result.boxes is not None and len(result.boxes) > 0:
+                        person_boxes = []
+                        for box in result.boxes:
+                            if box.cls is not None and int(box.cls[0]) == 0:
+                                person_boxes.append(box.xyxy[0].cpu().tolist())
+                        
+                        person_count = len(person_boxes)
+                        bbox = person_boxes[0] if person_boxes else None
+                    
+                    # State machine for clip detection
+                    if person_count == 1:
+                        if st is None:
+                            pid = next_id[0]  # Skip face encoding for speed
+                            next_id[0] += 1
+                            st = int(frame_idx)
+                        end = int(frame_idx)
+                    else:
+                        if st is not None:
+                            segs.append({
+                                "person_id": pid, 
+                                "start_ms": _ms(st, loader.dataset.fps),
+                                "end_ms": _ms(end, loader.dataset.fps)
+                            })
+                            st = end = pid = None
                 
-            batch.clear()
-            
-            # Progress update
-            if processed_frames % (batch_size * 10) == 0:
-                elapsed = time.time() - start_time
-                fps_processed = processed_frames / elapsed
-                print(f"[progress] {processed_frames} frames processed ({fps_processed:.1f} fps)")
+                # Performance monitoring
+                batch_time = time.time() - batch_start
+                if processed_batches % 10 == 0:
+                    fps = batch_size / batch_time
+                    gpu_util = self._get_gpu_utilization()
+                    print(f"[⚡] Batch {processed_batches}: {fps:.1f} fps | GPU: {gpu_util:.1f}%")
+                
+                # Memory management
+                if processed_batches % 50 == 0:
+                    torch.cuda.empty_cache()
+        
+        # Final clip
+        if st is not None:
+            segs.append({
+                "person_id": pid,
+                "start_ms": _ms(st, loader.dataset.fps),
+                "end_ms": _ms(end, loader.dataset.fps)
+            })
+        
+        # Performance stats
+        total_time = time.time() - start_time
+        total_frames = len(loader.dataset)
+        avg_fps = total_frames / total_time
+        
+        print(f"[🏁] COMPLETED: {total_frames} frames in {total_time:.2f}s")
+        print(f"[📊] Average FPS: {avg_fps:.1f} | Found {len(segs)} segments")
+        
+        return segs
     
-    # Process remaining frames in batch
-    if len(batch.frames) > 0:
-        batch_frames, batch_indices = batch.get_batch()
+    def _get_gpu_utilization(self):
+        """Get GPU utilization percentage"""
         try:
-            if use_half and device != "cpu":
-                with torch.cuda.amp.autocast():
-                    results = model(batch_frames, classes=[0], conf=conf, device=device, verbose=False, half=True)
-            else:
-                results = model(batch_frames, classes=[0], conf=conf, device=device, verbose=False, half=False)
-            
-            for result, frame_idx in zip(results, batch_indices):
-                all_results[frame_idx] = result
-        except Exception as e:
-            print(f"[warn] Error processing final batch: {e}")
-    
-    processing_time = time.time() - start_time
-    print(f"[batch] {video.name}: processed {processed_frames} frames in {processing_time:.2f}s ({processed_frames/processing_time:.1f} fps)")
-    
-    # Now process results sequentially to maintain temporal consistency
-    frame_indices = sorted(all_results.keys())
-    for idx in frame_indices:
-        r = all_results[idx]
-        
-        # Extract person detections
-        if r.boxes is None or len(r.boxes) == 0:
-            person_count = 0
-            bbox = None
-        else:
-            person_boxes = []
-            for box in r.boxes:
-                if box.cls is not None and int(box.cls[0]) == 0:  # person class
-                    person_boxes.append(box.xyxy[0].cpu().tolist())
-            
-            person_count = len(person_boxes)
-            bbox = person_boxes[0] if person_boxes else None
-        
-        if person_count == 1:
-            if st is None:
-                # For face encoding, we'd need the original frame
-                # For now, skip face encoding in streaming mode to save memory
-                enc = None  # _face_encoding(orig_frame, bbox) - disabled to save memory
-                pid = _match(enc, known, next_id)
-                st = idx
-            end = idx
-        else:
-            if st is not None:
-                segs.append({"person_id": pid, "start_ms": _ms(st, fps),
-                             "end_ms": _ms(end, fps)})
-                st = end = pid = None
+            if torch.cuda.is_available():
+                return torch.cuda.utilization()
+        except:
+            pass
+        return 0.0
 
-    if st is not None:
-        segs.append({"person_id": pid, "start_ms": _ms(st, fps),
-                     "end_ms": _ms(end, fps)})
 
-    # Clean up memory
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+# ═══════════ MAIN PROCESSING ═══════════
+
+def process_video_beast(video: Path, processor: RTX4070BeastProcessor, 
+                        batch_size: int, skip_frames: int, max_frames: int,
+                        known: List[Dict], next_id: list[int]) -> List[Dict]:
+    """Process single video in beast mode"""
+    
+    segs = processor.process_video_beast_mode(
+        video, batch_size, skip_frames, max_frames, known, next_id
+    )
+    
+    for s in segs:
+        s["video_id"] = video.stem
     
     return segs
 
 
-def _segments_streaming(video: Path, model: YOLO, *, conf: float, device: Union[str, int],
-                       known: List[Dict], next_id: list[int]) -> List[Dict]:
-    """
-    Original streaming method - kept for comparison and as fallback
-    """
-    cap = cv2.VideoCapture(str(video))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    cap.release()
-
-    segs: List[Dict] = []
-    st = end = None
-    pid = None
-
-    stream = model.track(source=str(video), stream=True, classes=[0], conf=conf,
-                         persist=True, device=device, verbose=False)
-
-    for idx, r in enumerate(stream):
-        ids_t = r.boxes.id
-        ids = [] if ids_t is None else list(set(ids_t.cpu().tolist()))
-
-        if len(ids) == 1:
-            tid = ids[0]
-            boxes = r.boxes.xyxy.cpu().tolist()
-            tids = ids_t.cpu().tolist()
-            bbox = next(b for b, t in zip(boxes, tids) if t == tid)
-
-            if st is None:
-                enc = _face_encoding(r.orig_img, bbox)
-                pid = _match(enc, known, next_id)
-                st = idx
-            end = idx
-        else:
-            if st is not None:
-                segs.append({"person_id": pid, "start_ms": _ms(st, fps),
-                             "end_ms": _ms(end, fps)})
-                st = end = pid = None
-
-    if st is not None:
-        segs.append({"person_id": pid, "start_ms": _ms(st, fps),
-                     "end_ms": _ms(end, fps)})
-
-    return segs
+def process_many_beast(dir_in: Path, weights: str, conf: float, device: str,
+                      patterns: List[str], batch_size: int, skip_frames: int,
+                      max_frames: int, parallel_videos: int) -> List[Dict]:
+    """Process multiple videos in BEAST MODE"""
+    
+    # Find videos
+    vids = []
+    for pattern in patterns:
+        vids.extend(dir_in.glob(pattern))
+    vids = sorted(vids)
+    
+    if not vids:
+        print(f"No videos found in {dir_in}")
+        return []
+    
+    print(f"[🎯] Found {len(vids)} videos to process")
+    
+    # Create beast processor
+    processor = RTX4070BeastProcessor(weights, device, conf)
+    
+    # Global face database
+    known: List[Dict] = []
+    next_id = [1]
+    lock = threading.Lock()
+    
+    all_clips = []
+    
+    if parallel_videos > 1 and len(vids) > 1:
+        print(f"[🚀] PARALLEL BEAST MODE: {parallel_videos} videos simultaneously")
+        
+        def process_video_thread(video):
+            with lock:
+                local_known = known.copy()
+                local_next_id = [next_id[0]]
+            
+            clips = process_video_beast(
+                video, processor, batch_size, skip_frames, max_frames,
+                local_known, local_next_id
+            )
+            
+            with lock:
+                # Update global state
+                for new_person in local_known[len(known):]:
+                    known.append(new_person)
+                next_id[0] = max(next_id[0], local_next_id[0])
+            
+            return clips
+        
+        with ThreadPoolExecutor(max_workers=parallel_videos) as executor:
+            futures = {executor.submit(process_video_thread, vid): vid for vid in vids}
+            
+            for future in as_completed(futures):
+                video = futures[future]
+                try:
+                    clips = future.result()
+                    all_clips.extend(clips)
+                    print(f"[✅] Completed: {video.name}")
+                except Exception as e:
+                    print(f"[❌] Failed: {video.name} - {e}")
+    else:
+        # Sequential processing
+        for vid in vids:
+            clips = process_video_beast(
+                vid, processor, batch_size, skip_frames, max_frames, known, next_id
+            )
+            all_clips.extend(clips)
+    
+    # Apply filtering and merging
+    filtered_clips = _filter_and_merge_clips(all_clips)
+    
+    return filtered_clips
 
 
 def _videos(dir_: Path, pats: Iterable[str]) -> List[Path]:
@@ -386,180 +473,108 @@ def _videos(dir_: Path, pats: Iterable[str]) -> List[Path]:
     return sorted(vids)
 
 
-# ───────── model ──────────
-
-def _load(weights: str | Path, device: Union[str, int], optimize: bool = True):
-    m = YOLO(str(weights))
-    if device not in ("cpu", "-1"):
-        m.to(f"cuda:{device}" if str(device).isdigit() else device)
-        
-    # RTX 4070 optimizations
-    if optimize and device != "cpu":
-        # Enable optimized attention and memory efficient attention
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        
-        # Initialize mixed precision scaler for stable training
-        if hasattr(torch.cuda.amp, 'GradScaler'):
-            print("[opt] Mixed precision support available")
-        
-        # Compile model for better performance (PyTorch 2.0+) - but avoid with half precision
-        try:
-            if hasattr(torch, 'compile'):
-                # Disable compilation when using half precision to avoid type conflicts
-                m.model = torch.compile(m.model, mode="reduce-overhead")
-                print("[opt] Model compiled with torch.compile")
-        except Exception as e:
-            print(f"[warn] Could not compile model: {e}")
-    
-    return m
-
-
-# ───────── processing ──────────
-
-def process_video(video: Path, *, model: YOLO, conf: float, device, known, next_id, 
-                 use_batch: bool = True, batch_size: int = 32, skip_frames: int = 1,
-                 max_frames: int = None, use_half: bool = True) -> List[Dict]:
-    
-    if use_batch:
-        segs = _segments_optimized(video, model, conf=conf, device=device, known=known, 
-                                  next_id=next_id, batch_size=batch_size, 
-                                  max_frames=max_frames, skip_frames=skip_frames, use_half=use_half)
-    else:
-        segs = _segments_streaming(video, model, conf=conf, device=device, known=known, next_id=next_id)
-    
-    for s in segs:
-        s["video_id"] = video.stem
-    print(f"[done] {video.name}: {len(segs)} clip(s)")
-    return segs
-
-
-def process_many(dir_in: Path, *, weights, conf, device, patterns, use_batch: bool = True,
-                batch_size: int = 32, skip_frames: int = 1, max_frames: int = None,
-                use_half: bool = True, parallel_videos: int = 1) -> List[Dict]:
-    """
-    Process multiple videos with GPU optimizations
-    parallel_videos: Process multiple videos in parallel (be careful with VRAM usage)
-    """
-    vids = _videos(dir_in, patterns)
-    if not vids:
-        print(f"No videos in {dir_in}")
-        return []
-
-    model = _load(weights, device, optimize=True)
-    clips: List[Dict] = []
-    
-    if parallel_videos > 1 and len(vids) > 1:
-        print(f"[parallel] Processing {len(vids)} videos with {parallel_videos} parallel workers")
-        
-        # Shared state for face recognition
-        known: List[Dict] = []
-        next_id = [1]
-        lock = threading.Lock()
-        
-        def process_video_thread(video):
-            with lock:
-                local_known = known.copy()
-                local_next_id = [next_id[0]]
-            
-            video_clips = process_video(video, model=model, conf=conf, device=device,
-                                      known=local_known, next_id=local_next_id,
-                                      use_batch=use_batch, batch_size=batch_size,
-                                      skip_frames=skip_frames, max_frames=max_frames,
-                                      use_half=use_half)
-            
-            with lock:
-                # Update global state
-                for new_person in local_known[len(known):]:
-                    known.append(new_person)
-                next_id[0] = max(next_id[0], local_next_id[0])
-            
-            return video_clips
-        
-        with ThreadPoolExecutor(max_workers=parallel_videos) as executor:
-            futures = [executor.submit(process_video_thread, v) for v in vids]
-            for future in futures:
-                clips.extend(future.result())
-    else:
-        # Sequential processing
-        known: List[Dict] = []
-        next_id = [1]
-        for v in vids:
-            clips.extend(process_video(v, model=model, conf=conf, device=device,
-                                     known=known, next_id=next_id, use_batch=use_batch,
-                                     batch_size=batch_size, skip_frames=skip_frames,
-                                     max_frames=max_frames, use_half=use_half))
-    
-    # Apply filtering and merging
-    clips = _filter_and_merge_clips(clips)
-    
-    return clips
-
-# ────────── CLI ───────────
+# ═══════════ CLI BEAST MODE ═══════════
 
 def _cli():
-    p = argparse.ArgumentParser(description="GPU-optimized person clip detector for RTX 4070")
-    p.add_argument("--input")
-    p.add_argument("--input-dir", default="/media/linuxbida/EXTERNAL_USB/Editor_videos/testing/procesar")
-    p.add_argument("--out-file")
-    p.add_argument("--output-dir", default="/media/linuxbida/EXTERNAL_USB/Editor_videos/testing/output")
-    p.add_argument("--model", default="yolov8n.pt", help="Model size: yolov8n.pt (fastest) to yolov8x.pt (most accurate)")
-    p.add_argument("--conf", type=float, default=0.3)
-    p.add_argument("--device", default="0")
-    p.add_argument("--patterns", nargs="*", default=["*.mp4", "*.mov", "*.mkv", "*.avi", "*.m4v"])
-    p.add_argument("--min-duration", type=int, default=100, help="Minimum clip duration in ms")
-    p.add_argument("--merge-gap", type=int, default=500, help="Max gap in ms to merge consecutive clips")
+    parser = argparse.ArgumentParser(
+        description="RTX 4070 BEAST MODE - Maximum GPU utilization for person detection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+🔥 BEAST MODE PRESETS:
+  --preset ultra    : Maximum speed (batch=96, skip=3)
+  --preset beast    : Balanced (batch=64, skip=2) 
+  --preset turbo    : Conservative (batch=32, skip=1)
+        """
+    )
     
-    # GPU optimization options
-    p.add_argument("--batch-size", type=int, default=16, help="Batch size for GPU processing (16-32 recommended for memory efficiency)")
-    p.add_argument("--skip-frames", type=int, default=2, help="Process every Nth frame (2=half frames, saves memory)")
-    p.add_argument("--max-frames", type=int, help="Limit frames per video (for testing)")
-    p.add_argument("--no-batch", action="store_true", help="Disable batch processing (use streaming)")
-    p.add_argument("--no-half", action="store_true", help="Disable half precision (FP16)")
-    p.add_argument("--parallel-videos", type=int, default=1, help="Process multiple videos in parallel")
+    # Basic options
+    parser.add_argument("--input", help="Single video file")
+    parser.add_argument("--input-dir", default="/media/linuxbida/EXTERNAL_USB/Editor_videos/data/videos")
+    parser.add_argument("--out-file", help="Output JSON file")
+    parser.add_argument("--output-dir", default="/media/linuxbida/EXTERNAL_USB/Editor_videos/testing/output")
+    parser.add_argument("--model", default="yolov8n.pt", help="yolov8n.pt (fastest) to yolov8x.pt (accurate)")
+    parser.add_argument("--conf", type=float, default=0.25, help="Detection confidence")
+    parser.add_argument("--device", default="0", help="GPU device")
+    parser.add_argument("--patterns", nargs="*", default=["*.mp4", "*.mov", "*.mkv", "*.avi", "*.m4v"])
     
-    args = p.parse_args()
-
-    # GPU info
+    # Filtering
+    parser.add_argument("--min-duration", type=int, default=100, help="Min clip duration (ms)")
+    parser.add_argument("--merge-gap", type=int, default=500, help="Max gap to merge clips (ms)")
+    
+    # BEAST MODE options
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size (32-128 for RTX 4070)")
+    parser.add_argument("--skip-frames", type=int, default=2, help="Process every Nth frame")
+    parser.add_argument("--max-frames", type=int, help="Limit frames (for testing)")
+    parser.add_argument("--parallel-videos", type=int, default=1, help="Process N videos in parallel")
+    
+    # Presets
+    parser.add_argument("--preset", choices=["ultra", "beast", "turbo"], 
+                       help="Performance preset")
+    
+    args = parser.parse_args()
+    
+    # Apply presets
+    if args.preset == "ultra":
+        args.batch_size = 96
+        args.skip_frames = 3
+        print("[🔥] ULTRA PRESET: Maximum speed, may sacrifice accuracy")
+    elif args.preset == "beast":
+        args.batch_size = 64
+        args.skip_frames = 2
+        print("[⚡] BEAST PRESET: Balanced speed and accuracy")
+    elif args.preset == "turbo":
+        args.batch_size = 32
+        args.skip_frames = 1
+        print("[🚀] TURBO PRESET: Conservative but fast")
+    
+    # System info
+    cpu_count = mp.cpu_count()
+    ram_gb = psutil.virtual_memory().total / 1024**3
+    print(f"[💻] System: {cpu_count} CPU cores, {ram_gb:.1f}GB RAM")
+    
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f"[gpu] Using {gpu_name} ({gpu_memory:.1f}GB VRAM)")
-        print(f"[gpu] Batch size: {args.batch_size}, Half precision: {not args.no_half}")
-        
-        # Check PyTorch and CUDA versions for compatibility
-        print(f"[info] PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}")
-        
-        # Warn about potential half precision issues
-        if not args.no_half:
-            print("[info] Half precision enabled - will fallback to float32 if incompatible")
-
-    of = Path(args.out_file) if args.out_file else Path(args.output_dir) / "clips.json"
-    of.parent.mkdir(parents=True, exist_ok=True)
-
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"[🎮] GPU: {gpu_name} ({vram_gb:.1f}GB VRAM)")
+        print(f"[⚙️] Settings: batch={args.batch_size}, skip={args.skip_frames}, parallel={args.parallel_videos}")
+    
+    # Output file
+    output_file = Path(args.out_file) if args.out_file else Path(args.output_dir) / "clips.json"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Process videos
+    start_time = time.time()
+    
     if args.input:
-        model = _load(args.model, args.device, optimize=True)
-        known: List[Dict] = []
-        next_id = [1]
-        clips = process_video(Path(args.input), model=model, conf=args.conf,
-                             device=args.device, known=known, next_id=next_id,
-                             use_batch=not args.no_batch, batch_size=args.batch_size,
-                             skip_frames=args.skip_frames, max_frames=args.max_frames,
-                             use_half=not args.no_half)
+        # Single video
+        processor = RTX4070BeastProcessor(args.model, args.device, args.conf)
+        clips = process_video_beast(
+            Path(args.input), processor, args.batch_size, args.skip_frames,
+            args.max_frames, [], [1]
+        )
         clips = _filter_and_merge_clips(clips, args.min_duration, args.merge_gap)
     else:
-        clips = process_many(Path(args.input_dir), weights=args.model, conf=args.conf,
-                           device=args.device, patterns=args.patterns,
-                           use_batch=not args.no_batch, batch_size=args.batch_size,
-                           skip_frames=args.skip_frames, max_frames=args.max_frames,
-                           use_half=not args.no_half, parallel_videos=args.parallel_videos)
-
+        # Multiple videos
+        clips = process_many_beast(
+            Path(args.input_dir), args.model, args.conf, args.device,
+            args.patterns, args.batch_size, args.skip_frames, args.max_frames,
+            args.parallel_videos
+        )
+    
+    total_time = time.time() - start_time
+    
+    # Save results
     if clips:
-        of.write_text(json.dumps(clips, indent=2))
-        print(f"[json] wrote {len(clips)} clip(s) → {of}")
+        output_file.write_text(json.dumps(clips, indent=2))
+        print(f"\n[🏆] SUCCESS!")
+        print(f"[📁] Saved {len(clips)} clips → {output_file}")
+        print(f"[⏱️] Total time: {total_time:.2f}s")
+        
+        # Performance summary
+        total_duration = sum(c["end_ms"] - c["start_ms"] for c in clips) / 1000
+        print(f"[📊] Found {total_duration:.1f}s of single-person content")
     else:
-        print("No clips detected; nothing written")
+        print("[❌] No clips detected")
 
 
 if __name__ == "__main__":
