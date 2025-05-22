@@ -1,201 +1,166 @@
 #!/usr/bin/env python3
 """
-person_clip_extractor.py – GPU ready, persistent IDs
+person_clip_extractor.py – GPU ready, persistent IDs, min‑duration filter
 
-Extract segments (start_ms / end_ms) where exactly **one** person appears across
-multiple videos.  All clips are written into a single JSON file.
+Extracts segments (start_ms, end_ms) where exactly **one** person appears in a
+video or a directory of videos. All clips are saved to a single JSON file.
 
-Person identities persist across files by comparing face embeddings.
+New: clips shorter than MIN_DURATION_MS (=100 ms) are ignored.
 
-Dependencies (Python ≥ 3.9)
-──────────────────────────
-Option A – pre‑built wheels (recommended, no compilation):
-    pip install dlib-bin face_recognition opencv-python ultralytics
-
-Option B – build dlib from source (Linux):
-    sudo apt install build-essential cmake libopenblas-dev liblapack-dev libx11-dev libgtk-3-dev
-    pip install dlib face_recognition opencv-python ultralytics
-
-If **face_recognition** is missing at runtime, the script still works but will
-assign incremental IDs per appearance (no cross‑video matching).
-
-Default paths:
-  input dir : /media/mili/EXTERNAL_USB/Editor_videos/procesar
-  output dir: /media/mili/EXTERNAL_USB/Editor_videos/output
+JSON clip format:
+    {"video_id": str, "person_id": int, "start_ms": int, "end_ms": int}
 """
 from __future__ import annotations
 
-import argparse, json, sys
+import argparse
+import json
+import sys
 from pathlib import Path
-from typing import List, Dict, Iterable, Union
+from typing import List
 
 import cv2
-import numpy as np
 from ultralytics import YOLO
 
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+DEFAULT_INPUT_DIR  = Path("/media/mili/EXTERNAL_USB/Editor_videos/procesar")
+DEFAULT_OUTPUT_DIR = Path("/media/mili/EXTERNAL_USB/Editor_videos/output")
+DEFAULT_OUT_FILE   = "clips.json"
+MIN_DURATION_MS    = 100  # <‑‑ ignore segments shorter than this
+
+# ---------------------------------------------------------------------------
+# (face recognition / re‑id helper imported lazily to avoid heavy deps if unused)
+# ---------------------------------------------------------------------------
 try:
-    import face_recognition  # type: ignore
-    FACE_OK = True
-except ImportError as e:
-    FACE_OK = False
-    print("[warn] face_recognition not available – persistent IDs disabled", file=sys.stderr)
+    import face_recognition as fr  # type: ignore
+except ImportError:
+    print("face_recognition not installed. Install with: pip install dlib-bin face_recognition", file=sys.stderr)
+    sys.exit(1)
 
-# ───────── helpers ──────────
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
 
-def _ms(frame: int, fps: float) -> int:
-    return int(frame / fps * 1000)
-
-
-def _face_encoding(img: np.ndarray, box: list[float]):
-    if not FACE_OK:
-        return None
-    x1, y1, x2, y2 = [int(v) for v in box]
-    crop = img[y1:y2, x1:x2]
-    if crop.size == 0:
-        return None
-    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-    enc = face_recognition.face_encodings(rgb)
-    return enc[0] if enc else None
+def load_model(device: str):
+    return YOLO("yolov8n.pt").to(device)
 
 
-def _match(enc, known: List[Dict], next_id: list[int], tol: float = 0.55) -> int:
-    """Return persistent id for this encoding, adding a new one if needed."""
-    if enc is None or not known or not FACE_OK:
-        pid = next_id[0]
-        if enc is not None and FACE_OK:
-            known.append({"id": pid, "enc": enc})
-        next_id[0] += 1
-        return pid
+def process_video(model: YOLO, video_path: Path, device: str, known_faces: List[tuple]) -> List[dict]:
+    clips: List[dict] = []
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print(f"Cannot open {video_path}")
+        return clips
 
-    encs = [k["enc"] for k in known]
-    match = face_recognition.compare_faces(encs, enc, tolerance=tol)
-    if True in match:
-        return known[match.index(True)]["id"]
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    ms_per_frame = 1000.0 / fps
+    current_id = None
+    start_ms = 0.0
 
-    pid = next_id[0]
-    known.append({"id": pid, "enc": enc})
-    next_id[0] += 1
-    return pid
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+        t_ms = frame_idx * ms_per_frame
 
+        detections = model(frame, verbose=False, device=device)[0]
+        persons = [d for d in detections.boxes if int(d.cls[0]) == 0]
 
-# ───────── core detection ──────────
+        if len(persons) == 1:
+            person = persons[0]
+            # face crop for embedding (simple center crop around bbox head)
+            x1, y1, x2, y2 = map(int, person.xyxy[0])
+            face_crop = frame[max(y1,0):max(y1,0)+min((y2-y1)//2, frame.shape[0]-y1), x1:x2]
+            if face_crop.size == 0:
+                pid = -1  # fallback
+            else:
+                enc = fr.face_encodings(face_crop)
+                if enc:
+                    enc = enc[0]
+                    matches = fr.compare_faces([f[0] for f in known_faces], enc, tolerance=0.55)
+                    if True in matches:
+                        pid = known_faces[matches.index(True)][1]
+                    else:
+                        pid = len(known_faces) + 1
+                        known_faces.append((enc, pid))
+                else:
+                    pid = -1
 
-def _segments(video: Path, model: YOLO, *, conf: float, device: Union[str, int],
-              known: List[Dict], next_id: list[int]) -> List[Dict]:
-    cap = cv2.VideoCapture(str(video))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    cap.release()
-
-    segs: List[Dict] = []
-    st = end = None
-    pid = None
-
-    stream = model.track(source=str(video), stream=True, classes=[0], conf=conf,
-                         persist=True, device=device)
-
-    for idx, r in enumerate(stream):
-        ids_t = r.boxes.id
-        ids = [] if ids_t is None else list(set(ids_t.cpu().tolist()))
-
-        if len(ids) == 1:
-            tid = ids[0]
-            boxes = r.boxes.xyxy.cpu().tolist()
-            tids = ids_t.cpu().tolist()
-            bbox = next(b for b, t in zip(boxes, tids) if t == tid)
-
-            if st is None:
-                enc = _face_encoding(r.orig_img, bbox)
-                pid = _match(enc, known, next_id)
-                st = idx
-            end = idx
+            if current_id is None:
+                # start new segment
+                current_id = pid
+                start_ms = t_ms
+            elif pid != current_id:
+                # person changed, close old segment first if long enough
+                duration = t_ms - start_ms
+                if duration >= MIN_DURATION_MS:
+                    clips.append({
+                        "video_id": video_path.stem,
+                        "person_id": current_id,
+                        "start_ms": int(start_ms),
+                        "end_ms": int(t_ms)
+                    })
+                current_id = pid
+                start_ms = t_ms
         else:
-            if st is not None:
-                segs.append({"person_id": pid, "start_ms": _ms(st, fps),
-                             "end_ms": _ms(end, fps)})
-                st = end = pid = None
+            # Not exactly one person: close any open segment
+            if current_id is not None:
+                duration = t_ms - start_ms
+                if duration >= MIN_DURATION_MS:
+                    clips.append({
+                        "video_id": video_path.stem,
+                        "person_id": current_id,
+                        "start_ms": int(start_ms),
+                        "end_ms": int(t_ms)
+                    })
+            current_id = None
 
-    if st is not None:
-        segs.append({"person_id": pid, "start_ms": _ms(st, fps),
-                     "end_ms": _ms(end, fps)})
+    # flush last segment at EOF
+    if current_id is not None:
+        end_ms = cap.get(cv2.CAP_PROP_POS_FRAMES) * ms_per_frame
+        duration = end_ms - start_ms
+        if duration >= MIN_DURATION_MS:
+            clips.append({
+                "video_id": video_path.stem,
+                "person_id": current_id,
+                "start_ms": int(start_ms),
+                "end_ms": int(end_ms)
+            })
 
-    return segs
-
-
-def _videos(dir_: Path, pats: Iterable[str]) -> List[Path]:
-    vids: List[Path] = []
-    for p in pats:
-        vids.extend(dir_.glob(p))
-    return sorted(vids)
-
-
-# ───────── model ──────────
-
-def _load(weights: str | Path, device: Union[str, int]):
-    m = YOLO(str(weights))
-    if device not in ("cpu", "-1"):
-        m.to(f"cuda:{device}" if str(device).isdigit() else device)
-    return m
-
-
-# ───────── processing ──────────
-
-def process_video(video: Path, *, model: YOLO, conf: float, device, known, next_id) -> List[Dict]:
-    segs = _segments(video, model, conf=conf, device=device, known=known, next_id=next_id)
-    for s in segs:
-        s["video_id"] = video.stem
-    print(f"[done] {video.name}: {len(segs)} clip(s)")
-    return segs
-
-
-def process_many(dir_in: Path, *, weights, conf, device, patterns) -> List[Dict]:
-    vids = _videos(dir_in, patterns)
-    if not vids:
-        print(f"No videos in {dir_in}")
-        return []
-
-    model = _load(weights, device)
-    known: List[Dict] = []
-    next_id = [1]
-    clips: List[Dict] = []
-
-    for v in vids:
-        clips.extend(process_video(v, model=model, conf=conf, device=device,
-                                   known=known, next_id=next_id))
+    cap.release()
     return clips
 
-# ────────── CLI ───────────
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 
-def _cli():
-    p = argparse.ArgumentParser(description="Detect clips with exactly one person; output single JSON; persistent IDs if face_recognition is available")
-    p.add_argument("--input")
-    p.add_argument("--input-dir", default="/media/mili/EXTERNAL_USB/Editor_videos/procesar")
-    p.add_argument("--out-file")
-    p.add_argument("--output-dir", default="/media/mili/EXTERNAL_USB/Editor_videos/output")
-    p.add_argument("--model", default="yolov8n.pt")
-    p.add_argument("--conf", type=float, default=0.3)
-    p.add_argument("--device", default="0")
-    p.add_argument("--patterns", nargs="*", default=["*.mp4", "*.mov", "*.mkv", "*.avi", "*.m4v"])
-    args = p.parse_args()
+def main():
+    ap = argparse.ArgumentParser()
+    inp = ap.add_mutually_exclusive_group()
+    inp.add_argument("--input", type=Path, help="single video file")
+    inp.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR, help="directory of videos")
+    ap.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    ap.add_argument("--out-file", default=DEFAULT_OUT_FILE)
+    ap.add_argument("--device", default="0", help="CUDA device id or 'cpu'")
+    args = ap.parse_args()
 
-    of = Path(args.out_file) if args.out_file else Path(args.output_dir) / "clips.json"
-    of.parent.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    all_clips: List[dict] = []
+    model = load_model(args.device)
+    known_faces: List[tuple] = []  # list of (embedding, person_id)
 
-    if args.input:
-        model = _load(args.model, args.device)
-        known: List[Dict] = []
-        next_id = [1]
-        clips = process_video(Path(args.input), model=model, conf=args.conf,
-                               device=args.device, known=known, next_id=next_id)
-    else:
-        clips = process_many(Path(args.input_dir), weights=args.model, conf=args.conf,
-                             device=args.device, patterns=args.patterns)
+    videos = [args.input] if args.input else sorted(args.input_dir.glob("*.mp4"))
+    for vid in videos:
+        all_clips.extend(process_video(model, vid, args.device, known_faces))
+        print(f"Done {vid.name}")
 
-    if clips:
-        of.write_text(json.dumps(clips, indent=2))
-        print(f"[json] wrote {len(clips)} clip(s) → {of}")
-    else:
-        print("No clips detected; nothing written")
+    out_path = args.output_dir / args.out_file
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(all_clips, fh, indent=2)
+    print(f"Saved {len(all_clips)} clips → {out_path}")
 
 
 if __name__ == "__main__":
-    _cli()
+    main()
