@@ -36,7 +36,12 @@ MIN_DURATION_MS    = 100  # ignore segments shorter than this
 try:
     import face_recognition as fr  # type: ignore
 except ImportError:
-    print("face_recognition not installed. Install with: pip install dlib-bin face_recognition", file=sys.stderr)
+    print(
+        "Missing dependency: face_recognition.\n"
+        "Install pre‑built wheels with:\n"
+        "    pip install dlib-bin==19.24.2 face_recognition",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
@@ -44,17 +49,13 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def parse_device(raw: str) -> str:
-    """Return a torch device string accepted by .to()."""
     raw = raw.strip().lower()
-    if raw in {"cpu", "cpu:0"}:
+    if raw.startswith("cpu"):
         return "cpu"
-    # numeric like "0" or "1"
     if raw.isdigit():
         return f"cuda:{raw}"
-    # already like "cuda" or "cuda:0"
     if raw.startswith("cuda"):
         return raw
-    # fallback
     return "cpu"
 
 
@@ -63,15 +64,16 @@ def load_model(device: str):
     return YOLO("yolov8n.pt").to(torch_device), torch_device
 
 
-def get_face_id(face_img, known_faces: List[Tuple[any, int]], tolerance: float = 0.55) -> int:
-    """Return stable person_id using face embeddings."""
-    if face_img.size == 0:
-        return -1
-    encodings = fr.face_encodings(face_img)
+def get_face_id(frame, box_xyxy, known_faces: List[Tuple[any, int]], tol: float = 0.55) -> int:
+    """Return a stable ID for the face inside *box_xyxy* (x1,y1,x2,y2)."""
+    x1, y1, x2, y2 = map(int, box_xyxy)
+    rgb = frame[:, :, ::-1]  # BGR → RGB
+    # face_recognition expects (top, right, bottom, left)
+    encodings = fr.face_encodings(rgb, [(y1, x2, y2, x1)])
     if not encodings:
-        return -1
+        return -1  # no face found
     enc = encodings[0]
-    matches = fr.compare_faces([f[0] for f in known_faces], enc, tolerance=tolerance)
+    matches = fr.compare_faces([f[0] for f in known_faces], enc, tolerance=tol)
     if True in matches:
         return known_faces[matches.index(True)][1]
     new_id = len(known_faces) + 1
@@ -102,14 +104,13 @@ def process_video(model: YOLO, video_path: Path, device: str, known_faces: List[
         persons = [d for d in detections.boxes if int(d.cls[0]) == 0]
 
         if len(persons) == 1:
-            x1, y1, x2, y2 = map(int, persons[0].xyxy[0])
-            head_crop = frame[max(y1, 0):max(y1, 0) + (y2 - y1) // 2, x1:x2]
-            pid = get_face_id(head_crop, known_faces)
+            x1, y1, x2, y2 = map(float, persons[0].xyxy[0])
+            pid = get_face_id(frame, (x1, y1, x2, y2), known_faces)
 
             if current_id is None:
                 current_id = pid
                 start_ms = t_ms
-            elif pid != current_id:
+            elif pid != current_id and pid != -1:
                 duration = t_ms - start_ms
                 if duration >= MIN_DURATION_MS:
                     clips.append({
