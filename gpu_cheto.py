@@ -76,15 +76,16 @@ class GPUOptimizer:
 
 # ═══════════ ULTRA-FAST DATASET ═══════════
 
-class VideoFrameDataset(Dataset):
-    """Custom dataset for ultra-fast batch loading"""
+class MemoryEfficientVideoReader:
+    """Memory-efficient video reader with single CV2 instance"""
     
     def __init__(self, video_path: Path, skip_frames: int = 1, max_frames: int = None):
         self.video_path = video_path
         self.skip_frames = skip_frames
         self.max_frames = max_frames
+        self.cap = None
         
-        # Pre-calculate frame indices
+        # Get video info
         cap = cv2.VideoCapture(str(video_path))
         self.fps = cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -94,45 +95,76 @@ class VideoFrameDataset(Dataset):
         if max_frames:
             self.frame_indices = self.frame_indices[:max_frames]
         
-        print(f"[dataset] {video_path.name}: {len(self.frame_indices)} frames to process")
+        print(f"[reader] {video_path.name}: {len(self.frame_indices)} frames")
+    
+    def __enter__(self):
+        self.cap = cv2.VideoCapture(str(self.video_path))
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+    
+    def read_batch(self, start_idx: int, batch_size: int):
+        """Read a batch of frames efficiently"""
+        frames = []
+        indices = []
+        
+        end_idx = min(start_idx + batch_size, len(self.frame_indices))
+        
+        for i in range(start_idx, end_idx):
+            frame_idx = self.frame_indices[i]
+            
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = self.cap.read()
+            
+            if ret:
+                # Resize frame to save memory (optional)
+                # frame = cv2.resize(frame, (640, 480))  # Uncomment if needed
+                frames.append(frame)
+                indices.append(frame_idx)
+        
+        return frames, indices
     
     def __len__(self):
         return len(self.frame_indices)
-    
-    def __getitem__(self, idx):
-        frame_idx = self.frame_indices[idx]
-        
-        # Fast frame extraction
-        cap = cv2.VideoCapture(str(self.video_path))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-        cap.release()
-        
-        if not ret:
-            # Return black frame if failed
-            frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        
-        return frame, frame_idx
 
 
-class MultiThreadVideoLoader:
-    """Asynchronous video frame loader with thread pool"""
+class MemoryManager:
+    """Aggressive memory management"""
     
-    def __init__(self, video_path: Path, batch_size: int, skip_frames: int = 1, 
-                 max_frames: int = None, num_workers: int = 4):
-        self.dataset = VideoFrameDataset(video_path, skip_frames, max_frames)
-        self.dataloader = DataLoader(
-            self.dataset, 
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=4
-        )
+    @staticmethod
+    def cleanup_all():
+        """Force cleanup of all memory"""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    
+    @staticmethod 
+    def get_memory_usage():
+        """Get current memory usage"""
+        process = psutil.Process(os.getpid())
+        ram_mb = process.memory_info().rss / 1024 / 1024
         
-    def __iter__(self):
-        return iter(self.dataloader)
+        vram_mb = 0
+        if torch.cuda.is_available():
+            vram_mb = torch.cuda.memory_allocated() / 1024 / 1024
+        
+        return ram_mb, vram_mb
+    
+    @staticmethod
+    def check_memory_limit(max_ram_gb: float = 8.0):
+        """Check if we're approaching memory limit"""
+        ram_mb, vram_mb = MemoryManager.get_memory_usage()
+        ram_gb = ram_mb / 1024
+        
+        if ram_gb > max_ram_gb:
+            print(f"[⚠️] RAM usage high: {ram_gb:.1f}GB - forcing cleanup")
+            MemoryManager.cleanup_all()
+            return True
+        return False
 
 
 # ═══════════ TURBO PROCESSING ENGINE ═══════════
@@ -254,77 +286,69 @@ class RTX4070BeastProcessor:
         
         return model
     
-    def process_video_beast_mode(self, video_path: Path, batch_size: int = 64, 
-                                skip_frames: int = 1, max_frames: int = None,
-                                known: List[Dict] = None, next_id: list[int] = None) -> List[Dict]:
-        """Process video with MAXIMUM RTX 4070 utilization"""
+    def process_video_memory_safe(self, video_path: Path, batch_size: int = 32, 
+                                 skip_frames: int = 2, max_frames: int = None,
+                                 known: List[Dict] = None, next_id: list[int] = None) -> List[Dict]:
+        """Memory-safe video processing"""
         
         if known is None:
             known = []
         if next_id is None:
             next_id = [1]
         
-        print(f"\n[🔥] BEAST MODE PROCESSING: {video_path.name}")
-        print(f"[⚙️] Batch size: {batch_size} | Skip frames: {skip_frames}")
-        
-        # Create turbo loader
-        loader = MultiThreadVideoLoader(
-            video_path, batch_size, skip_frames, max_frames, num_workers=6
-        )
+        print(f"\n[🔥] MEMORY-SAFE PROCESSING: {video_path.name}")
         
         segs: List[Dict] = []
         st = end = None
         pid = None
         
         start_time = time.time()
-        processed_batches = 0
+        processed_frames = 0
         
-        # MAXIMUM SPEED PROCESSING
-        with torch.cuda.amp.autocast(enabled=True):  # Mixed precision
-            for batch_frames, batch_indices in loader:
-                processed_batches += 1
-                batch_start = time.time()
+        # Use memory-efficient reader
+        with MemoryEfficientVideoReader(video_path, skip_frames, max_frames) as reader:
+            total_batches = (len(reader) + batch_size - 1) // batch_size
+            
+            for batch_idx in range(total_batches):
+                batch_start_idx = batch_idx * batch_size
                 
-                # Convert to tensor for GPU processing
-                if isinstance(batch_frames, (list, tuple)):
-                    frames_tensor = torch.stack([torch.from_numpy(f) for f in batch_frames])
-                else:
-                    frames_tensor = batch_frames
+                # Read batch efficiently
+                frames, frame_indices = reader.read_batch(batch_start_idx, batch_size)
                 
-                # Ultra-fast inference
-                try:
-                    results = self.model(
-                        batch_frames.numpy() if hasattr(batch_frames, 'numpy') else batch_frames,
-                        classes=[0],  # Only person class
-                        conf=self.conf,
-                        device=self.device,
-                        verbose=False,
-                        half=True,
-                        agnostic_nms=True,  # Faster NMS
-                        max_det=10  # Limit detections for speed
-                    )
-                except Exception as e:
-                    print(f"[error] Batch processing failed: {e}")
+                if not frames:
                     continue
                 
-                # Process results FAST
-                for result, frame_idx in zip(results, batch_indices.numpy() if hasattr(batch_indices, 'numpy') else batch_indices):
+                # Process batch
+                try:
+                    with torch.cuda.amp.autocast(enabled=True):
+                        results = self.model(
+                            frames,
+                            classes=[0],
+                            conf=self.conf,
+                            device=self.device,
+                            verbose=False,
+                            half=True,
+                            agnostic_nms=True,
+                            max_det=5  # Limit detections for memory
+                        )
+                except Exception as e:
+                    print(f"[error] Batch {batch_idx} failed: {e}")
+                    # Clean up and continue
+                    del frames
+                    MemoryManager.cleanup_all()
+                    continue
+                
+                # Process results immediately (don't store)
+                for result, frame_idx in zip(results, frame_indices):
                     person_count = 0
-                    bbox = None
                     
                     if result.boxes is not None and len(result.boxes) > 0:
-                        person_boxes = []
-                        for box in result.boxes:
-                            if box.cls is not None and int(box.cls[0]) == 0:
-                                person_boxes.append(box.xyxy[0].cpu().tolist())
-                        
-                        person_count = len(person_boxes)
-                        bbox = person_boxes[0] if person_boxes else None
+                        person_count = sum(1 for box in result.boxes if box.cls is not None and int(box.cls[0]) == 0)
                     
                     # State machine for clip detection
                     if person_count == 1:
                         if st is None:
-                            pid = next_id[0]  # Skip face encoding for speed
+                            pid = next_id[0]
                             next_id[0] += 1
                             st = int(frame_idx)
                         end = int(frame_idx)
@@ -332,37 +356,41 @@ class RTX4070BeastProcessor:
                         if st is not None:
                             segs.append({
                                 "person_id": pid, 
-                                "start_ms": _ms(st, loader.dataset.fps),
-                                "end_ms": _ms(end, loader.dataset.fps)
+                                "start_ms": _ms(st, reader.fps),
+                                "end_ms": _ms(end, reader.fps)
                             })
                             st = end = pid = None
                 
-                # Performance monitoring
-                batch_time = time.time() - batch_start
-                if processed_batches % 10 == 0:
-                    fps = batch_size / batch_time
-                    gpu_util = self._get_gpu_utilization()
-                    print(f"[⚡] Batch {processed_batches}: {fps:.1f} fps | GPU: {gpu_util:.1f}%")
+                # Immediate cleanup after each batch
+                del frames, results
+                processed_frames += len(frame_indices)
                 
-                # Memory management
-                if processed_batches % 50 == 0:
-                    torch.cuda.empty_cache()
+                # Aggressive memory management
+                if batch_idx % 10 == 0:
+                    MemoryManager.cleanup_all()
+                    ram_mb, vram_mb = MemoryManager.get_memory_usage()
+                    fps = processed_frames / (time.time() - start_time)
+                    print(f"[⚡] Batch {batch_idx}/{total_batches}: {fps:.1f} fps | RAM: {ram_mb:.0f}MB | VRAM: {vram_mb:.0f}MB")
+                    
+                    # Check memory limits
+                    MemoryManager.check_memory_limit(max_ram_gb=6.0)  # Conservative limit
         
         # Final clip
         if st is not None:
             segs.append({
                 "person_id": pid,
-                "start_ms": _ms(st, loader.dataset.fps),
-                "end_ms": _ms(end, loader.dataset.fps)
+                "start_ms": _ms(st, reader.fps),
+                "end_ms": _ms(end, reader.fps)
             })
         
-        # Performance stats
-        total_time = time.time() - start_time
-        total_frames = len(loader.dataset)
-        avg_fps = total_frames / total_time
+        # Final cleanup
+        MemoryManager.cleanup_all()
         
-        print(f"[🏁] COMPLETED: {total_frames} frames in {total_time:.2f}s")
-        print(f"[📊] Average FPS: {avg_fps:.1f} | Found {len(segs)} segments")
+        total_time = time.time() - start_time
+        avg_fps = processed_frames / total_time if total_time > 0 else 0
+        
+        print(f"[🏁] {video_path.name}: {processed_frames} frames in {total_time:.2f}s ({avg_fps:.1f} fps)")
+        print(f"[📊] Found {len(segs)} segments")
         
         return segs
     
@@ -489,7 +517,7 @@ def _cli():
     
     # Basic options
     parser.add_argument("--input", help="Single video file")
-    parser.add_argument("--input-dir", default="/media/linuxbida/EXTERNAL_USB/Editor_videos/data/videos")
+    parser.add_argument("--input-dir", default="/media/linuxbida/EXTERNAL_USB/Editor_videos/testing/procesar")
     parser.add_argument("--out-file", help="Output JSON file")
     parser.add_argument("--output-dir", default="/media/linuxbida/EXTERNAL_USB/Editor_videos/testing/output")
     parser.add_argument("--model", default="yolov8n.pt", help="yolov8n.pt (fastest) to yolov8x.pt (accurate)")
@@ -505,7 +533,8 @@ def _cli():
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (32-128 for RTX 4070)")
     parser.add_argument("--skip-frames", type=int, default=2, help="Process every Nth frame")
     parser.add_argument("--max-frames", type=int, help="Limit frames (for testing)")
-    parser.add_argument("--parallel-videos", type=int, default=1, help="Process N videos in parallel")
+    parser.add_argument("--save-interval", type=int, default=5, help="Save checkpoint every N videos")
+    parser.add_argument("--max-ram-gb", type=float, default=6.0, help="Max RAM usage before cleanup (GB)")
     
     # Presets
     parser.add_argument("--preset", choices=["ultra", "beast", "turbo"], 
@@ -513,19 +542,19 @@ def _cli():
     
     args = parser.parse_args()
     
-    # Apply presets
+    # Apply presets with memory-safe defaults
     if args.preset == "ultra":
-        args.batch_size = 96
+        args.batch_size = 48  # Reduced for memory
         args.skip_frames = 3
-        print("[🔥] ULTRA PRESET: Maximum speed, may sacrifice accuracy")
+        print("[🔥] ULTRA PRESET: High speed, memory-safe")
     elif args.preset == "beast":
-        args.batch_size = 64
+        args.batch_size = 32  # Reduced for memory
         args.skip_frames = 2
-        print("[⚡] BEAST PRESET: Balanced speed and accuracy")
+        print("[⚡] BEAST PRESET: Balanced speed and memory")
     elif args.preset == "turbo":
-        args.batch_size = 32
+        args.batch_size = 24  # Reduced for memory
         args.skip_frames = 1
-        print("[🚀] TURBO PRESET: Conservative but fast")
+        print("[🚀] TURBO PRESET: Conservative memory usage")
     
     # System info
     cpu_count = mp.cpu_count()
@@ -536,7 +565,8 @@ def _cli():
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(f"[🎮] GPU: {gpu_name} ({vram_gb:.1f}GB VRAM)")
-        print(f"[⚙️] Settings: batch={args.batch_size}, skip={args.skip_frames}, parallel={args.parallel_videos}")
+        print(f"[⚙️] Settings: batch={args.batch_size}, skip={args.skip_frames}")
+        print(f"[💾] Memory limits: {args.max_ram_gb}GB RAM max")
     
     # Output file
     output_file = Path(args.out_file) if args.out_file else Path(args.output_dir) / "clips.json"
@@ -548,17 +578,17 @@ def _cli():
     if args.input:
         # Single video
         processor = RTX4070BeastProcessor(args.model, args.device, args.conf)
-        clips = process_video_beast(
+        clips = process_video_safe(
             Path(args.input), processor, args.batch_size, args.skip_frames,
             args.max_frames, [], [1]
         )
         clips = _filter_and_merge_clips(clips, args.min_duration, args.merge_gap)
     else:
-        # Multiple videos
-        clips = process_many_beast(
+        # Multiple videos with memory safety
+        clips = process_many_memory_safe(
             Path(args.input_dir), args.model, args.conf, args.device,
             args.patterns, args.batch_size, args.skip_frames, args.max_frames,
-            args.parallel_videos
+            args.save_interval
         )
     
     total_time = time.time() - start_time
